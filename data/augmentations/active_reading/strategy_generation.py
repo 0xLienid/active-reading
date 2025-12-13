@@ -58,6 +58,7 @@ and remember all of the information contained? Use markdown and prefix each stra
     model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16)
     tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
     tokenizer.pad_token = tokenizer.eos_token
+    model.eval()
 
     if accelerator.is_main_process:
         print(f"Loading dataset and preparing dataloader")
@@ -67,15 +68,17 @@ and remember all of the information contained? Use markdown and prefix each stra
         dataset, batch_size=per_device_batch_size)
 
     model, dataloader = accelerator.prepare(model, dataloader)
+    unwrapped_model = accelerator.unwrap_model(model)
+    unwrapped_model.eval()
 
     all_local_rows = []
     for batch in tqdm(dataloader, desc=f"Generating on rank {accelerator.process_index}..."):
         batch_prompts = [PROMPT.format(document=page)
                          for page in batch["page"]]
-        batch_inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True).to(model.device)
+        batch_inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True).to(accelerator.device)
 
         with torch.no_grad():
-            outputs = model.generate(
+            outputs = unwrapped_model.generate(
                 batch_inputs["input_ids"],
                 attention_mask=batch_inputs["attention_mask"],
                 max_new_tokens=256,
