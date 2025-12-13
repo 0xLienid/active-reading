@@ -17,7 +17,7 @@ def parse_strategies(outputs: List[str]) -> List[List[str]]:
     """
     Parse the strategies from the output.
     """
-    return [[strategy.strip() for strategy in output.split("##") if strategy.strip()] for output in outputs]
+    return [[strategy.strip() for strategy in output.split("##") if strategy.strip() and ("</document>" not in strategy or "</div>" not in strategy)] for output in outputs]
 
 
 def generate_strategies_task_agnostic(
@@ -46,6 +46,8 @@ and remember all of the information contained? Use markdown and prefix each stra
 <document>
 {document}
 </document>
+
+## Strategy 1
 """
 
     torch.manual_seed(seed)
@@ -60,7 +62,7 @@ and remember all of the information contained? Use markdown and prefix each stra
     if accelerator.is_main_process:
         print(f"Loading dataset and preparing dataloader")
 
-    dataset = load_dataset("mfirth/simplewikiqa-pages", split="train").select(range(1))
+    dataset = load_dataset("mfirth/simplewikiqa-pages", split="train")
     dataloader = DataLoader(
         dataset, batch_size=per_device_batch_size)
 
@@ -76,12 +78,8 @@ and remember all of the information contained? Use markdown and prefix each stra
             outputs = model.generate(
                 batch_inputs["input_ids"],
                 attention_mask=batch_inputs["attention_mask"],
-                min_new_tokens=64,
-                max_new_tokens=2048,
-                pad_token_id=tokenizer.eos_token_id,
-                do_sample=True,
-                temperature=0.7,
-                top_p=0.95
+                max_new_tokens=256,
+                pad_token_id=tokenizer.eos_token_id
             )
             outputs = tokenizer.batch_decode(
                 outputs[:, batch_inputs["input_ids"].shape[1]:], skip_special_tokens=True)
