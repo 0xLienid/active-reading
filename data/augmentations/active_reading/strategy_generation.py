@@ -7,16 +7,10 @@ from datasets import Dataset, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
+from utils import to_safe_model_name
 from dotenv import load_dotenv
 
 load_dotenv()
-
-
-def to_safe_model_name(model_name: str) -> str:
-    """
-    Convert a model name to a safe model name for saving to the Hugging Face Hub.
-    """
-    return model_name.replace("/", "-")
 
 
 def parse_strategies(outputs: List[str]) -> List[List[str]]:
@@ -36,11 +30,13 @@ def generate_strategies_task_agnostic(
     Generate task-agnostic data augmentation strategies.
 
     Args:
+        accelerator: The accelerator to use.
         model_name: The name of the model to use.
         per_device_batch_size: The number of examples to process per device.
+        seed: The seed to use for the random number generator.
 
     Returns:
-        A list of strategies.
+        A dataset of with learning strategies for each example.
     """
 
     PROMPT = """
@@ -70,7 +66,7 @@ and remember all of the information contained? Use markdown and prefix each stra
     model, dataloader = accelerator.prepare(model, dataloader)
 
     all_local_rows = []
-    for batch in tqdm(dataloader):
+    for batch in tqdm(dataloader, desc=f"Generating on rank {accelerator.process_index}..."):
         batch_prompts = [PROMPT.format(document=page)
                          for page in batch["page"]]
         batch_inputs = tokenizer(batch_prompts, return_tensors="pt", return_dict=True,
