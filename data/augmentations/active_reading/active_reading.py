@@ -7,7 +7,7 @@ from datasets import Dataset, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
-from utils import to_safe_model_name
+from utils import to_safe_model_name, gather_object_to_main
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -118,7 +118,7 @@ Apply this strategy to the following document:
             })
 
     accelerator.wait_for_everyone()
-    gathered = accelerator.utils.gather_object(all_local_rows)
+    gathered = gather_object_to_main(accelerator, all_local_rows)
 
     active_reading_dataset = []
     if accelerator.is_main_process:

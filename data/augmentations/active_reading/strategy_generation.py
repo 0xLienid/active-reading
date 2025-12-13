@@ -7,7 +7,7 @@ from datasets import Dataset, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
-from utils import to_safe_model_name
+from utils import to_safe_model_name, gather_object_to_main
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -53,13 +53,14 @@ and remember all of the information contained? Use markdown and prefix each stra
     if accelerator.is_main_process:
         print(f"Loading model {model_name}")
 
-    model = AutoModelForCausalLM.from_pretrained(model_name)
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
+    tokenizer.pad_token = tokenizer.eos_token
 
     if accelerator.is_main_process:
         print(f"Loading dataset and preparing dataloader")
 
-    dataset = load_dataset("mfirth/simplewikiqa", split="train")
+    dataset = load_dataset("mfirth/simplewikiqa-pages", split="train").select(range(1))
     dataloader = DataLoader(
         dataset, batch_size=per_device_batch_size)
 
@@ -69,18 +70,21 @@ and remember all of the information contained? Use markdown and prefix each stra
     for batch in tqdm(dataloader, desc=f"Generating on rank {accelerator.process_index}..."):
         batch_prompts = [PROMPT.format(document=page)
                          for page in batch["page"]]
-        batch_inputs = tokenizer(batch_prompts, return_tensors="pt", return_dict=True,
-                                 padding=True, truncation=True, max_length=2048).to(model.device)
+        batch_inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True).to(model.device)
 
         with torch.no_grad():
             outputs = model.generate(
                 batch_inputs["input_ids"],
                 attention_mask=batch_inputs["attention_mask"],
+                min_new_tokens=64,
                 max_new_tokens=2048,
-                pad_token_id=tokenizer.eos_token_id
+                pad_token_id=tokenizer.eos_token_id,
+                do_sample=True,
+                temperature=0.7,
+                top_p=0.95
             )
             outputs = tokenizer.batch_decode(
-                outputs.sequences[:, batch_inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+                outputs[:, batch_inputs["input_ids"].shape[1]:], skip_special_tokens=True)
 
         strategies = parse_strategies(outputs)
 
@@ -90,11 +94,11 @@ and remember all of the information contained? Use markdown and prefix each stra
                 "url": batch["url"][i],
                 "title": batch["title"][i],
                 "page": batch["page"][i],
-                "strategy": strategies_for_example
+                "strategies": strategies_for_example
             })
 
     accelerator.wait_for_everyone()
-    gathered = accelerator.utils.gather_object(all_local_rows)
+    gathered = gather_object_to_main(accelerator, all_local_rows)
 
     strategies_dataset = []
     if accelerator.is_main_process:
@@ -108,7 +112,7 @@ def generate_strategies_task_specific(
     accelerator: Accelerator,
     model_name: str,
     per_device_batch_size: int,
-    task: "trivia" | "finance",
+    task: Literal["trivia", "finance"],
     seed: int = 42
 ):
     """
@@ -146,7 +150,6 @@ if __name__ == "__main__":
             accelerator, args.model_name, args.per_device_batch_size, args.task, args.seed)
 
     if accelerator.is_main_process:
-        print(f"Saving strategies dataset")
         strategies_dataset = Dataset.from_list(strategies_dataset)
         strategies_dataset.push_to_hub(f"mfirth/simplewikiqa-strategies-{to_safe_model_name(args.model_name)}", split="train",
                                        token=os.getenv("HF_TOKEN"))
