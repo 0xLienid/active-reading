@@ -18,27 +18,37 @@ def flatten_dataset(dataset: Dataset) -> Dataset:
     Flatten strategies from each row so that each row has a single strategy, meaning that
     each row expands into n_strategies rows.
     """
-    return dataset.map(lambda x: [{"url": x["url"], "title": x["title"], "page": x["page"], "strategy": strategy} for strategy in x["strategy"]])
+    return dataset.map(lambda x: [{"url": x["url"], "title": x["title"], "document": x["document"], "strategy": strategy} for strategy in x["strategy"]])
 
 
-def unflatten_dataset(dataset: Dataset) -> Dataset:
+def unflatten_dataset(dataset: Dataset | List[Dict[str, Any]]) -> Dataset:
     """
     Group rows by url, title, and page, and concatenate the strategies and applied strategies into a single row.
     """
 
-    key_cols = ("url", "title", "page")
+    if not isinstance(dataset, Dataset):
+        dataset = Dataset.from_list(dataset)
+
+    doc_col = "document" if "document" in dataset.column_names else "page"
+    key_cols = ("url", "title", doc_col)
+
+    rename_cols = {
+        "strategy": "strategies",
+        "applied_strategy": "applied_strategies",
+    }
+
     value_cols = [c for c in dataset.column_names if c not in key_cols]
 
     grouped: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     for row in dataset:
-        key = (row["url"], row["title"], row["page"])
+        key = (row["url"], row["title"], row[doc_col])
         if key not in grouped:
-            grouped[key] = {"url": key[0], "title": key[1], "page": key[2]}
+            grouped[key] = {"url": key[0], "title": key[1], doc_col: key[2]}
             for c in value_cols:
-                grouped[key][c] = []
+                grouped[key][rename_cols.get(c, c)] = []
 
         for c in value_cols:
-            grouped[key][c].append(row.get(c))
+            grouped[key][rename_cols.get(c, c)].append(row.get(c))
 
     return Dataset.from_list(list(grouped.values()))
 
@@ -94,7 +104,7 @@ Apply this strategy to the following document:
     all_local_rows = []
     for batch in tqdm(dataloader, desc=f"Generating on rank {accelerator.process_index}..."):
         batch_prompts = [PROMPT.format(strategy=strategy, document=page)
-                         for strategy, page in zip(batch["strategy"], batch["page"])]
+                         for strategy, page in zip(batch["strategy"], batch["document"])]
         batch_inputs = tokenizer(batch_prompts, return_tensors="pt", return_dict=True,
                                  padding=True, truncation=True, max_length=2048).to(model.device)
 
@@ -112,7 +122,7 @@ Apply this strategy to the following document:
             all_local_rows.append({
                 "url": batch["url"][i],
                 "title": batch["title"][i],
-                "page": batch["page"][i],
+                "document": batch["document"][i],
                 "strategy": batch["strategy"][i],
                 "applied_strategy": outputs[i]
             })
