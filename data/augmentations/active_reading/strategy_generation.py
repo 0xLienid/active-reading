@@ -118,7 +118,6 @@ and remember all of the information contained? Use markdown and prefix each stra
 {document}
 </document>
 
-## Strategy 1
 """
 
     torch.manual_seed(seed)
@@ -264,5 +263,5 @@ if __name__ == "__main__":
 
     if accelerator.is_main_process:
         strategies_dataset = Dataset.from_list(strategies_dataset)
-        strategies_dataset.push_to_hub(f"mfirth/simplewikiqa-strategies-{to_safe_model_name(args.model_name)}", split="train",
+        strategies_dataset.push_to_hub(f"mfirth/simplewikiqa-strategies-{to_safe_model_name(args.model_name)}-test", split="train",
                                        token=os.getenv("HF_TOKEN"))
