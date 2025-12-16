@@ -1,7 +1,7 @@
 import os
 import argparse
 import torch
-from typing import List, Literal, Optional
+from typing import Dict, List, Literal, Optional
 from tqdm import tqdm
 from datasets import Dataset, load_dataset, load_from_disk
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -12,14 +12,50 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DEFAULT_MAX_PAGE_TOKENS = 2048
+DEFAULT_MAX_PAGE_TOKENS = 1024
 
 
 def parse_strategies(outputs: List[str]) -> List[List[str]]:
     """
     Parse the strategies from the output.
     """
-    return [[strategy.strip() for strategy in output.split("##") if strategy.strip() and ("</document>" not in strategy or "</div>" not in strategy)] for output in outputs]
+    parsed: List[List[str]] = []
+    for output in outputs:
+        # 1) split by markdown "##" headings
+        chunks = output.split("##")
+
+        # 2) split each chunk into lines
+        strategies: List[str] = []
+        for chunk in chunks:
+            for line in chunk.split("\n"):
+                s = line.strip()
+                if not s:
+                    continue
+                # Filter common prompt/document artifacts.
+                if "</document>" in s or "</div>" in s:
+                    continue
+                # Filter out low-signal "strategies" that are likely headings,
+                # numbering, or model noise.
+                # - no spaces: single token like "Strategy:" or "1."
+                # - < 4 words: too short to be an actionable strategy
+                if " " not in s:
+                    continue
+                if len(s.split()) < 4:
+                    continue
+                strategies.append(s)
+
+        # 3) de-dupe while preserving order
+        seen = set()
+        deduped: List[str] = []
+        for s in strategies:
+            if s in seen:
+                continue
+            seen.add(s)
+            deduped.append(s)
+
+        parsed.append(deduped)
+
+    return parsed
 
 
 def _chunk_text_by_tokens(text: str, tokenizer, max_tokens: int) -> List[str]:
@@ -89,6 +125,30 @@ def preprocess_dataset_split_pages(
         desc=desc or f"Splitting pages into <= {max_page_tokens} tokens",
     )
 
+
+def process_batch(
+    accelerator: Accelerator,
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    tokenized_batch: Dict[str, torch.Tensor],
+    max_new_tokens: int = 256,
+    temperature: float = 0.7,
+    top_p: float = 0.9
+) -> List[List[str]]:
+    with torch.no_grad():
+        outputs = model.generate(
+            tokenized_batch["input_ids"],
+            attention_mask=tokenized_batch["attention_mask"],
+            max_new_tokens=max_new_tokens,
+            pad_token_id=tokenizer.eos_token_id,
+            do_sample=True,
+            temperature=temperature,
+            top_p=top_p
+        )
+        outputs = tokenizer.batch_decode(
+            outputs[:, tokenized_batch["input_ids"].shape[1]:], skip_special_tokens=True)
+
+    return parse_strategies(outputs)
 
 def generate_strategies_task_agnostic(
     accelerator: Accelerator,
@@ -179,32 +239,62 @@ and remember all of the information contained? Use markdown and prefix each stra
     unwrapped_model.eval()
 
     all_local_rows = []
+    to_reprocess = []
     for batch in tqdm(dataloader, desc=f"Generating on rank {accelerator.process_index}..."):
         batch_prompts = [PROMPT.format(document=page)
                          for page in batch["page"]]
         batch_inputs = tokenizer(
             batch_prompts, return_tensors="pt", padding=True).to(accelerator.device)
 
-        with torch.no_grad():
-            outputs = unwrapped_model.generate(
-                batch_inputs["input_ids"],
-                attention_mask=batch_inputs["attention_mask"],
-                max_new_tokens=256,
-                pad_token_id=tokenizer.eos_token_id
-            )
-            outputs = tokenizer.batch_decode(
-                outputs[:, batch_inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        generated_strategies = process_batch(
+            accelerator, unwrapped_model, tokenizer, batch_inputs, max_new_tokens=256, temperature=0.6, top_p=0.95)
 
-        strategies = parse_strategies(outputs)
+        for i, generated_strategy_for_example in enumerate(generated_strategies):
+            if len(generated_strategy_for_example) == 0:
+                to_reprocess.append({
+                    "url": batch["url"][i],
+                    "title": batch["title"][i],
+                    "page": batch["page"][i]
+                })
+                continue
 
-        for i in range(len(outputs)):
-            strategies_for_example = strategies[i]
             all_local_rows.append({
                 "url": batch["url"][i],
                 "title": batch["title"][i],
                 "document": batch["page"][i],
-                "strategies": strategies_for_example
+                "strategies": generated_strategy_for_example
             })
+
+    while len(to_reprocess) > 0:
+        reprocessing_dataset = Dataset.from_list(to_reprocess)
+        reprocessing_dataloader = DataLoader(
+            reprocessing_dataset, batch_size=per_device_batch_size)
+        
+        to_reprocess = []
+        for batch in tqdm(reprocessing_dataloader, desc=f"Reprocessing on rank {accelerator.process_index}..."):
+            batch_prompts = [PROMPT.format(document=page)
+                             for page in batch["page"]]
+            batch_inputs = tokenizer(
+                batch_prompts, return_tensors="pt", padding=True).to(accelerator.device)
+
+            generated_strategies = process_batch(
+                accelerator, unwrapped_model, tokenizer, batch_inputs, max_new_tokens=256, temperature=0.6, top_p=0.95)
+
+            for i, generated_strategy_for_example in enumerate(generated_strategies):
+                if len(generated_strategy_for_example) == 0:
+                    to_reprocess.append({
+                        "url": batch["url"][i],
+                        "title": batch["title"][i],
+                        "page": batch["page"][i]
+                    })
+                    continue
+
+                all_local_rows.append({
+                    "url": batch["url"][i],
+                    "title": batch["title"][i],
+                    "document": batch["page"][i],
+                    "strategies": generated_strategy_for_example
+                })
 
     accelerator.wait_for_everyone()
     gathered = gather_object_to_main(accelerator, all_local_rows)
