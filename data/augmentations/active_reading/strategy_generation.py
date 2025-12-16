@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DEFAULT_MAX_PAGE_TOKENS = 1024
+DEFAULT_MAX_PAGE_TOKENS = 2048
 DEFAULT_MAX_RETRIES = 5
 
 
