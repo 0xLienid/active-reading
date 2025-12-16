@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DEFAULT_MAX_PAGE_TOKENS = 1024
+DEFAULT_MAX_RETRIES = 5
 
 
 def parse_strategies(outputs: List[str]) -> List[List[str]]:
@@ -150,11 +151,13 @@ def process_batch(
 
     return parse_strategies(outputs)
 
+
 def generate_strategies_task_agnostic(
     accelerator: Accelerator,
     model_name: str,
     per_device_batch_size: int,
     max_page_tokens: int = DEFAULT_MAX_PAGE_TOKENS,
+    max_retries: int = DEFAULT_MAX_RETRIES,
     seed: int = 42
 ):
     """
@@ -189,7 +192,6 @@ and remember all of the information contained? Use markdown and prefix each stra
         model_name, torch_dtype=torch.bfloat16)
     tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
     tokenizer.pad_token = tokenizer.eos_token
-    model.eval()
 
     if accelerator.is_main_process:
         print(f"Loading dataset and preparing dataloader")
@@ -265,11 +267,12 @@ and remember all of the information contained? Use markdown and prefix each stra
                 "strategies": generated_strategy_for_example
             })
 
-    while len(to_reprocess) > 0:
+    num_retries = 0
+    while len(to_reprocess) > 0 and num_retries < max_retries:
         reprocessing_dataset = Dataset.from_list(to_reprocess)
         reprocessing_dataloader = DataLoader(
             reprocessing_dataset, batch_size=per_device_batch_size)
-        
+
         to_reprocess = []
         for batch in tqdm(reprocessing_dataloader, desc=f"Reprocessing on rank {accelerator.process_index}..."):
             batch_prompts = [PROMPT.format(document=page)
@@ -295,6 +298,8 @@ and remember all of the information contained? Use markdown and prefix each stra
                     "document": batch["page"][i],
                     "strategies": generated_strategy_for_example
                 })
+
+        num_retries += 1
 
     accelerator.wait_for_everyone()
     gathered = gather_object_to_main(accelerator, all_local_rows)
@@ -336,6 +341,7 @@ if __name__ == "__main__":
         "--task", type=Literal["trivia", "finance"], required=False)
     parser.add_argument("--max-page-tokens", type=int,
                         default=DEFAULT_MAX_PAGE_TOKENS)
+    parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -343,7 +349,7 @@ if __name__ == "__main__":
 
     if args.task_agnostic:
         strategies_dataset = generate_strategies_task_agnostic(
-            accelerator, args.model_name, args.per_device_batch_size, args.max_page_tokens, args.seed)
+            accelerator, args.model_name, args.per_device_batch_size, args.max_page_tokens, args.max_retries, args.seed)
     else:
         if args.task is None:
             raise ValueError("Task is required when task-agnostic is False")
