@@ -34,7 +34,7 @@ def parse_strategies(outputs: List[str]) -> List[List[str]]:
             if not s:
                 continue
 
-            if s.split() < 20:
+            if len(s.split()) < 20:
                 continue
 
             if s in seen:
