@@ -23,32 +23,20 @@ def parse_strategies(outputs: List[str]) -> List[List[str]]:
     parsed: List[List[str]] = []
     for output in outputs:
         # 1) split by markdown "##" headings
-        chunks = output.split("##")
+        strategies = output.split("##")
 
-        # 2) split each chunk into lines
-        strategies: List[str] = []
-        for chunk in chunks:
-            for line in chunk.split("\n"):
-                s = line.strip()
-                if not s:
-                    continue
-                # Filter common prompt/document artifacts.
-                if "</document>" in s or "</div>" in s:
-                    continue
-                # Filter out low-signal "strategies" that are likely headings,
-                # numbering, or model noise.
-                # - no spaces: single token like "Strategy:" or "1."
-                # - < 4 words: too short to be an actionable strategy
-                if " " not in s:
-                    continue
-                if len(s.split()) < 4:
-                    continue
-                strategies.append(s)
-
-        # 3) de-dupe while preserving order
+        # 2) Filter and de-dupe while preserving order
         seen = set()
         deduped: List[str] = []
         for s in strategies:
+            s = s.strip()
+
+            if not s:
+                continue
+
+            if s.split() < 20:
+                continue
+
             if s in seen:
                 continue
             seen.add(s)
@@ -247,7 +235,7 @@ and remember all of the information contained? Use markdown and prefix each stra
     for batch in tqdm(dataloader, desc=f"Generating on rank {accelerator.process_index}..."):
         batch_prompts = [
             [
-                {"role": "system", "content": "You are a helpful assistant."}
+                {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": PROMPT.format(document=page)}
             ]
             for page in batch["page"]

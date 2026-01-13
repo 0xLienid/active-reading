@@ -20,7 +20,37 @@ def flatten_dataset(dataset: Dataset) -> Dataset:
     Flatten strategies from each row so that each row has a single strategy, meaning that
     each row expands into n_strategies rows.
     """
-    return dataset.map(lambda x: [{"url": x["url"], "title": x["title"], "document": x["document"], "strategy": strategy} for strategy in x["strategy"]])
+    def _expand_batch(batch: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
+        urls: List[Any] = []
+        titles: List[Any] = []
+        documents: List[Any] = []
+        strategies: List[Any] = []
+
+        for url, title, doc, strats in zip(
+            batch["url"], batch["title"], batch["document"], batch["strategies"]
+        ):
+            if not strats:
+                continue
+
+            for strategy in strats:
+                urls.append(url)
+                titles.append(title)
+                documents.append(doc)
+                strategies.append(strategy)
+
+        return {
+            "url": urls,
+            "title": titles,
+            "document": documents,
+            "strategy": strategies,
+        }
+
+    return dataset.map(
+        _expand_batch,
+        batched=True,
+        remove_columns=list(dataset.column_names),
+        desc="Flattening strategies",
+    )
 
 
 def unflatten_dataset(dataset: Dataset | List[Dict[str, Any]]) -> Dataset:
@@ -35,7 +65,6 @@ def unflatten_dataset(dataset: Dataset | List[Dict[str, Any]]) -> Dataset:
     key_cols = ("url", "title", doc_col)
 
     rename_cols = {
-        "strategy": "strategies",
         "applied_strategy": "applied_strategies",
     }
 
@@ -110,10 +139,12 @@ Apply this strategy to the following document:
     all_local_rows = []
     to_reprocess = []
     for batch in tqdm(dataloader, desc=f"Generating on rank {accelerator.process_index}..."):
-        batch_prompts = [PROMPT.format(strategy=strategy, document=page)
-                         for strategy, page in zip(batch["strategy"], batch["document"])]
-        batch_inputs = tokenizer(
-            batch_prompts, return_tensors="pt", padding=True).to(model.device)
+        batch_prompts = [[
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": PROMPT.format(strategy=strategy, document=page)}
+        ] for strategy, page in zip(batch["strategy"], batch["document"])]
+        batch_inputs = tokenizer.apply_chat_template(
+            batch_prompts, add_generation_prompt=True, tokenize=True, return_tensors="pt", return_dict=True, padding=True).to(model.device)
 
         with torch.no_grad():
             outputs = unwrapped_model.generate(
@@ -123,7 +154,7 @@ Apply this strategy to the following document:
                 pad_token_id=tokenizer.eos_token_id
             )
             outputs = tokenizer.batch_decode(
-                outputs.sequences[:, batch_inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+                outputs[:, batch_inputs["input_ids"].shape[1]:], skip_special_tokens=True)
 
         for i, output in enumerate(outputs):
             if len(output) == 0 or len(output.split()) < 30:
@@ -151,10 +182,12 @@ Apply this strategy to the following document:
 
         to_reprocess = []
         for batch in tqdm(reprocessing_dataloader, desc=f"Reprocessing on rank {accelerator.process_index}..."):
-            batch_prompts = [PROMPT.format(strategy=strategy, document=page)
-                             for strategy, page in zip(batch["strategy"], batch["document"])]
-            batch_inputs = tokenizer(
-                batch_prompts, return_tensors="pt", padding=True).to(model.device)
+            batch_prompts = [[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": PROMPT.format(strategy=strategy, document=page)}
+            ] for strategy, page in zip(batch["strategy"], batch["document"])]
+            batch_inputs = tokenizer.apply_chat_template(
+                batch_prompts, add_generation_prompt=True, return_tensors="pt", return_in_dict=True, padding=True).to(model.device)
 
             with torch.no_grad():
                 outputs = unwrapped_model.generate(
