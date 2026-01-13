@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DEFAULT_MAX_PAGE_TOKENS = 2048
+DEFAULT_MAX_PAGE_TOKENS = 512
 DEFAULT_MAX_RETRIES = 5
 
 
@@ -66,6 +66,8 @@ def _chunk_text_by_tokens(text: str, tokenizer, max_tokens: int) -> List[str]:
     """
     if not text:
         return [""]
+
+    text = text.split("== References ==")[0].strip()
 
     input_ids = tokenizer(text, add_special_tokens=False).input_ids
     if len(input_ids) <= max_tokens:
@@ -243,13 +245,18 @@ and remember all of the information contained? Use markdown and prefix each stra
     all_local_rows = []
     to_reprocess = []
     for batch in tqdm(dataloader, desc=f"Generating on rank {accelerator.process_index}..."):
-        batch_prompts = [PROMPT.format(document=page)
-                         for page in batch["page"]]
-        batch_inputs = tokenizer(
-            batch_prompts, return_tensors="pt", padding=True).to(accelerator.device)
+        batch_prompts = [
+            [
+                {"role": "system", "content": "You are a helpful assistant."}
+                {"role": "user", "content": PROMPT.format(document=page)}
+            ]
+            for page in batch["page"]
+        ]
+        batch_inputs = tokenizer.apply_chat_template(batch_prompts, add_generation_prompt=True, tokenize=True, return_tensors="pt", return_dict=True,
+                                                     padding=True, truncation=True, max_length=2048).to(accelerator.device)
 
         generated_strategies = process_batch(
-            accelerator, unwrapped_model, tokenizer, batch_inputs, max_new_tokens=256, temperature=0.6, top_p=0.95)
+            accelerator, unwrapped_model, tokenizer, batch_inputs, max_new_tokens=1024, temperature=0.9, top_p=0.95)
 
         for i, generated_strategy_for_example in enumerate(generated_strategies):
             if len(generated_strategy_for_example) == 0:
@@ -275,13 +282,17 @@ and remember all of the information contained? Use markdown and prefix each stra
 
         to_reprocess = []
         for batch in tqdm(reprocessing_dataloader, desc=f"Reprocessing on rank {accelerator.process_index}..."):
-            batch_prompts = [PROMPT.format(document=page)
-                             for page in batch["page"]]
-            batch_inputs = tokenizer(
-                batch_prompts, return_tensors="pt", padding=True).to(accelerator.device)
+            batch_prompts = [
+                [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": PROMPT.format(document=page)}]
+                for page in batch["page"]
+            ]
+            batch_inputs = tokenizer.apply_chat_template(batch_prompts, add_generation_prompt=True, tokenize=True, return_tensors="pt", return_dict=True,
+                                                         padding=True, truncation=True, max_length=2048).to(accelerator.device)
 
             generated_strategies = process_batch(
-                accelerator, unwrapped_model, tokenizer, batch_inputs, max_new_tokens=256, temperature=0.6, top_p=0.95)
+                accelerator, unwrapped_model, tokenizer, batch_inputs, max_new_tokens=1024, temperature=0.9, top_p=0.95)
 
             for i, generated_strategy_for_example in enumerate(generated_strategies):
                 if len(generated_strategy_for_example) == 0:
@@ -359,5 +370,5 @@ if __name__ == "__main__":
 
     if accelerator.is_main_process:
         strategies_dataset = Dataset.from_list(strategies_dataset)
-        strategies_dataset.push_to_hub(f"mfirth/simplewikiqa-strategies-{to_safe_model_name(args.model_name)}-test", split="train",
+        strategies_dataset.push_to_hub(f"mfirth/simplewikiqa-strategies-{to_safe_model_name(args.model_name)}", split="train",
                                        token=os.getenv("HF_TOKEN"))

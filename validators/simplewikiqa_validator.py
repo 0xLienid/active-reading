@@ -160,8 +160,8 @@ class SimpleWikiQAValidator(Validator):
                 for example in batch
             ]
 
-            batch_inputs = tokenizer(batch_prompts, return_tensors="pt", return_dict=True,
-                                     padding=True, truncation=True, max_length=2048).to(model.device)
+            batch_inputs = tokenizer.apply_chat_template(batch_prompts, add_generation_prompt=True, tokenize=True, return_tensors="pt", return_dict=True,
+                                                         padding=True, truncation=True, max_length=2048).to(model.device)
 
             with torch.no_grad():
                 outputs = model.generate(
