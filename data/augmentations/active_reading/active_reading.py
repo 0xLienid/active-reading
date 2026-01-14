@@ -1,7 +1,7 @@
 import os
 import argparse
 import torch
-from typing import List, Literal, Dict, Any, Tuple
+from typing import List, Literal, Dict, Any, Tuple, Optional
 from tqdm import tqdm
 from datasets import Dataset, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -84,13 +84,49 @@ def unflatten_dataset(dataset: Dataset | List[Dict[str, Any]]) -> Dataset:
     return Dataset.from_list(list(grouped.values()))
 
 
+def push_checkpoint(
+    accelerator: Accelerator,
+    all_local_rows: List[Dict[str, Any]],
+    repo_id: Optional[str],
+    step: int,
+):
+    """
+    Gather current rows from all ranks and push a checkpoint to the Hub.
+    """
+    if not repo_id:
+        return
+
+    accelerator.wait_for_everyone()
+    gathered = gather_object_to_main(accelerator, all_local_rows)
+
+    if not accelerator.is_main_process:
+        return
+
+    combined: List[Dict[str, Any]] = []
+    for rows in gathered:
+        combined.extend(rows)
+
+    if not combined:
+        return
+
+    ds = unflatten_dataset(combined)
+    ds.push_to_hub(
+        repo_id,
+        split="train",
+        token=os.getenv("HF_TOKEN"),
+        commit_message=f"checkpoint step {step}",
+    )
+
+
 def generate_active_reading_dataset(
     accelerator: Accelerator,
     model_name: str,
     dataset_name: str,
     per_device_batch_size: int,
     max_retries: int = DEFAULT_MAX_RETRIES,
-    seed: int = 42
+    seed: int = 42,
+    checkpoint_steps: int = 0,
+    repo_id: Optional[str] = None,
 ):
     """
     Generate an active reading dataset.
@@ -100,6 +136,8 @@ def generate_active_reading_dataset(
         model_name: The name of the model to use.
         per_device_batch_size: The number of examples to process per device.
         seed: The seed to use for the random number generator.
+        checkpoint_steps: If > 0, periodically push checkpoints every N steps.
+        repo_id: Optional HF repo id to push checkpoints to.
 
     Returns:
         A dataset applying learning strategies to documents.
@@ -136,12 +174,14 @@ Apply this strategy to the following document:
     unwrapped_model = accelerator.unwrap_model(model)
     unwrapped_model.eval()
 
+    step = 0
     all_local_rows = []
     to_reprocess = []
     for batch in tqdm(dataloader, desc=f"Generating on rank {accelerator.process_index}..."):
         batch_prompts = [[
             {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": PROMPT.format(strategy=strategy, document=page)}
+            {"role": "user", "content": PROMPT.format(
+                strategy=strategy, document=page)}
         ] for strategy, page in zip(batch["strategy"], batch["document"])]
         batch_inputs = tokenizer.apply_chat_template(
             batch_prompts, add_generation_prompt=True, tokenize=True, return_tensors="pt", return_dict=True, padding=True).to(model.device)
@@ -174,6 +214,10 @@ Apply this strategy to the following document:
                 "applied_strategy": outputs[i]
             })
 
+        step += 1
+        if checkpoint_steps > 0 and step % checkpoint_steps == 0:
+            push_checkpoint(accelerator, all_local_rows, repo_id, step)
+
     num_retries = 0
     while len(to_reprocess) > 0 and num_retries < max_retries:
         reprocessing_dataset = Dataset.from_list(to_reprocess)
@@ -184,7 +228,8 @@ Apply this strategy to the following document:
         for batch in tqdm(reprocessing_dataloader, desc=f"Reprocessing on rank {accelerator.process_index}..."):
             batch_prompts = [[
                 {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": PROMPT.format(strategy=strategy, document=page)}
+                {"role": "user", "content": PROMPT.format(
+                    strategy=strategy, document=page)}
             ] for strategy, page in zip(batch["strategy"], batch["document"])]
             batch_inputs = tokenizer.apply_chat_template(
                 batch_prompts, add_generation_prompt=True, return_tensors="pt", return_in_dict=True, padding=True).to(model.device)
@@ -217,6 +262,10 @@ Apply this strategy to the following document:
                     "applied_strategy": outputs[i]
                 })
 
+            step += 1
+            if checkpoint_steps > 0 and step % checkpoint_steps == 0:
+                push_checkpoint(accelerator, all_local_rows, repo_id, step)
+
         num_retries += 1
 
     accelerator.wait_for_everyone()
@@ -238,13 +287,26 @@ if __name__ == "__main__":
     parser.add_argument("--dataset-name", type=str, required=True)
     parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--checkpoint-steps", type=int, default=0)
     args = parser.parse_args()
 
     accelerator = Accelerator()
+    repo_id = f"mfirth/simplewikiqa-active-reading-{to_safe_model_name(args.model_name)}"
     active_reading_dataset = generate_active_reading_dataset(
-        accelerator, args.model_name, args.dataset_name, args.per_device_batch_size, args.max_retries, args.seed)
+        accelerator,
+        args.model_name,
+        args.dataset_name,
+        args.per_device_batch_size,
+        args.max_retries,
+        args.seed,
+        args.checkpoint_steps,
+        repo_id,
+    )
 
     if accelerator.is_main_process:
         print(f"Saving active reading dataset")
-        active_reading_dataset.push_to_hub(f"mfirth/simplewikiqa-active-reading-{to_safe_model_name(args.model_name)}", split="train",
-                                           token=os.getenv("HF_TOKEN"))
+        active_reading_dataset.push_to_hub(
+            repo_id,
+            split="train",
+            token=os.getenv("HF_TOKEN"),
+        )
