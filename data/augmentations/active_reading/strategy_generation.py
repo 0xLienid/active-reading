@@ -1,11 +1,12 @@
 import os
 import argparse
 import torch
+from datetime import timedelta
 from typing import Dict, List, Literal, Optional
 from tqdm import tqdm
 from datasets import Dataset, load_dataset, load_from_disk
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from accelerate import Accelerator
+from accelerate import Accelerator, InitProcessGroupKwargs
 from torch.utils.data import DataLoader
 from utils import to_safe_model_name, gather_object_to_main
 from dotenv import load_dotenv
@@ -45,6 +46,40 @@ def parse_strategies(outputs: List[str]) -> List[List[str]]:
         parsed.append(deduped)
 
     return parsed
+
+
+def push_checkpoint(
+    accelerator: Accelerator,
+    all_local_rows: List[Dict[str, str]],
+    repo_id: Optional[str],
+    step: int,
+):
+    """
+    Gather current rows from all ranks and push a checkpoint to the Hub.
+    """
+    if not repo_id:
+        return
+
+    accelerator.wait_for_everyone()
+    gathered = gather_object_to_main(accelerator, all_local_rows)
+
+    if not accelerator.is_main_process:
+        return
+
+    combined: List[Dict[str, str]] = []
+    for rows in gathered:
+        combined.extend(rows)
+
+    if not combined:
+        return
+        
+    ds = Dataset.from_list(combined)
+    ds.push_to_hub(
+        repo_id,
+        split="train",
+        token=os.getenv("HF_TOKEN"),
+        commit_message=f"checkpoint step {step}",
+    )
 
 
 def _chunk_text_by_tokens(text: str, tokenizer, max_tokens: int) -> List[str]:
@@ -148,7 +183,9 @@ def generate_strategies_task_agnostic(
     per_device_batch_size: int,
     max_page_tokens: int = DEFAULT_MAX_PAGE_TOKENS,
     max_retries: int = DEFAULT_MAX_RETRIES,
-    seed: int = 42
+    seed: int = 42,
+    checkpoint_steps: int = 0,
+    repo_id: Optional[str] = None,
 ):
     """
     Generate task-agnostic data augmentation strategies.
@@ -230,6 +267,7 @@ and remember all of the information contained? Use markdown and prefix each stra
     unwrapped_model = accelerator.unwrap_model(model)
     unwrapped_model.eval()
 
+    step = 0
     all_local_rows = []
     to_reprocess = []
     for batch in tqdm(dataloader, desc=f"Generating on rank {accelerator.process_index}..."):
@@ -261,6 +299,11 @@ and remember all of the information contained? Use markdown and prefix each stra
                 "document": batch["page"][i],
                 "strategies": generated_strategy_for_example
             })
+
+        step += 1
+
+        if checkpoint_steps > 0 and step % checkpoint_steps == 0:
+            push_checkpoint(accelerator, all_local_rows, repo_id, step)
 
     num_retries = 0
     while len(to_reprocess) > 0 and num_retries < max_retries:
@@ -298,6 +341,11 @@ and remember all of the information contained? Use markdown and prefix each stra
                     "strategies": generated_strategy_for_example
                 })
 
+            step += 1
+
+            if checkpoint_steps > 0 and step % checkpoint_steps == 0:
+                push_checkpoint(accelerator, all_local_rows, repo_id, step)
+
         num_retries += 1
 
     accelerator.wait_for_everyone()
@@ -317,7 +365,9 @@ def generate_strategies_task_specific(
     per_device_batch_size: int,
     task: Literal["trivia", "finance"],
     max_page_tokens: int = DEFAULT_MAX_PAGE_TOKENS,
-    seed: int = 42
+    seed: int = 42,
+    checkpoint_steps: int = 0,
+    repo_id: Optional[str] = None,
 ):
     """
     Generate task-specific data augmentation strategies.
@@ -342,21 +392,43 @@ if __name__ == "__main__":
                         default=DEFAULT_MAX_PAGE_TOKENS)
     parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--checkpoint-steps", type=int, default=0)
     args = parser.parse_args()
 
-    accelerator = Accelerator()
+    accelerator = Accelerator(
+        kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(hours=12))]
+    )
+
+    repo_id = f"mfirth/simplewikiqa-strategies-{to_safe_model_name(args.model_name)}"
 
     if args.task_agnostic:
         strategies_dataset = generate_strategies_task_agnostic(
-            accelerator, args.model_name, args.per_device_batch_size, args.max_page_tokens, args.max_retries, args.seed)
+            accelerator,
+            args.model_name,
+            args.per_device_batch_size,
+            args.max_page_tokens,
+            args.max_retries,
+            args.seed,
+            args.checkpoint_steps,
+            repo_id,
+        )
     else:
         if args.task is None:
             raise ValueError("Task is required when task-agnostic is False")
 
         strategies_dataset = generate_strategies_task_specific(
-            accelerator, args.model_name, args.per_device_batch_size, args.task, args.max_page_tokens, args.seed)
+            accelerator,
+            args.model_name,
+            args.per_device_batch_size,
+            args.task,
+            args.max_page_tokens,
+            args.seed,
+            args.checkpoint_steps,
+            repo_id,
+        )
 
     if accelerator.is_main_process:
         strategies_dataset = Dataset.from_list(strategies_dataset)
-        strategies_dataset.push_to_hub(f"mfirth/simplewikiqa-strategies-{to_safe_model_name(args.model_name)}", split="train",
-                                       token=os.getenv("HF_TOKEN"))
+        strategies_dataset.push_to_hub(
+            repo_id, split="train", token=os.getenv("HF_TOKEN")
+        )
