@@ -488,6 +488,8 @@ if __name__ == "__main__":
         """Convert a flattened active reading sample to training text."""
         return sample["applied_strategy"]
 
+    NUM_GPUS = 4
+
     config = TrainingConfig(
         model_name="meta-llama/Llama-3.1-8B-Instruct",
         core_dataset="mfirth/simplewikiqa-active-reading-meta-llama-Llama-3.1-8B-Instruct",
@@ -496,7 +498,7 @@ if __name__ == "__main__":
         pretraining_dataset="mlfoundations/dclm-baseline-1.0",
         pretraining_ratio=0.1,
         batch_size=4,
-        gradient_accumulation_steps=128 // 4,
+        gradient_accumulation_steps=128 // (NUM_GPUS * 4),
         learning_rate=1e-5,
         max_seq_length=4096,
         max_steps=20000,
