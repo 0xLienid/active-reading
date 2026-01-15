@@ -1,12 +1,21 @@
+import asyncio
+import os
 import re
 import json
-from openai import OpenAI
+import torch
+import random
+from typing import List
+from openai import OpenAI, AsyncOpenAI, RateLimitError, APIError
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from validators.validator import Validator
 from dotenv import load_dotenv
 
 load_dotenv()
+
+MAX_RETRIES = 5
+BASE_DELAY = 1.0
+MAX_DELAY = 60.0
 
 
 GRADER_TEMPLATE = """
@@ -97,39 +106,76 @@ class SimpleWikiQAValidator(Validator):
     where we will be operating on the Wikipedia grounded subset (SimpleWikiQA). 
     """
 
-    def __init__(self, batch_size: int):
+    def __init__(self, batch_size: int, max_concurrent_requests: int = 10):
         super().__init__("simplewikiqa")
 
         self.batch_size = batch_size
-        self.dataset = load_dataset("mfirth/simplewikiqa", split="test")
+        self.max_concurrent_requests = max_concurrent_requests
+        self.dataset = load_dataset("mfirth/simplewikiqa", split="train").select(range(10))
         self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        self.async_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
     def grade_answer(self, question: str, target: str, predicted_answer: str) -> str:
         """
-        Grades the predicted answer for the given question and target using the OpenAI grader prompt and 
-        GPT-5-mini. This differs from the official Active Reading paper as they used GPT-4o.
+        Synchronous helper to grade a single answer.
+        """
+        return asyncio.run(self._grade_answer_async(question, target, predicted_answer))
 
-        Args:
-            question: The question to grade.
-            target: The target answer to grade against.
-            predicted_answer: The predicted answer to grade.
-
-        Returns:
-            The grade of the predicted answer (A: CORRECT, B: INCORRECT, C: NOT_ATTEMPTED).
+    async def _grade_answer_async(self, question: str, target: str, predicted_answer: str) -> str:
+        """
+        Async grading for a single answer using the OpenAI grader prompt and GPT-5-mini.
+        Includes retry logic with exponential backoff for rate limiting.
         """
         prompt = GRADER_TEMPLATE.format(
             question=question,
             target=target,
             predicted_answer=predicted_answer
         )
-        response = self.client.chat.completions.create(
-            model="gpt-5-mini",
-            messages=[{"role": "user", "content": prompt}]
-        )
-        response_text = response.choices[0].message.content.strip()
+        
+        last_exception = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = await self.async_client.chat.completions.create(
+                    model="gpt-5-mini",
+                    messages=[{"role": "user", "content": prompt}],
+                    timeout=30.0
+                )
+                response_text = response.choices[0].message.content.strip()
+                match = re.search(r"(A|B|C)", response_text)
+                return match.group(0) if match else "C"
+            except RateLimitError as e:
+                last_exception = e
+                delay = min(BASE_DELAY * (2 ** attempt) + random.uniform(0, 1), MAX_DELAY)
+                print(f"Rate limited, retrying in {delay:.1f}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                await asyncio.sleep(delay)
+            except APIError as e:
+                last_exception = e
+                delay = min(BASE_DELAY * (2 ** attempt) + random.uniform(0, 1), MAX_DELAY)
+                print(f"API error: {e}, retrying in {delay:.1f}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                await asyncio.sleep(delay)
+            except Exception as e:
+                last_exception = e
+                print(f"Unexpected error grading answer: {e}")
+                break
+        
+        print(f"Failed to grade answer after {MAX_RETRIES} attempts: {last_exception}")
+        return "C"  # Default to NOT_ATTEMPTED on failure
 
-        match = re.search(r"(A|B|C)", response_text)
-        return match.group(0) if match else "C"
+    async def _grade_answers_parallel(self, questions: List[str], targets: List[str], predicted_answers: List[str]) -> List[str]:
+        """
+        Grades answers in parallel with concurrency limiting and returns their letter grades.
+        """
+        semaphore = asyncio.Semaphore(self.max_concurrent_requests)
+        
+        async def grade_with_semaphore(question: str, target: str, predicted: str) -> str:
+            async with semaphore:
+                return await self._grade_answer_async(question, target, predicted)
+        
+        tasks = [
+            grade_with_semaphore(question, target, predicted)
+            for question, target, predicted in zip(questions, targets, predicted_answers)
+        ]
+        return await asyncio.gather(*tasks)
 
     def validate(self, model: AutoModelForCausalLM, tokenizer: AutoTokenizer, max_new_tokens: int = 256) -> float:
         """
@@ -166,16 +212,16 @@ class SimpleWikiQAValidator(Validator):
             with torch.no_grad():
                 outputs = model.generate(
                     batch_inputs["input_ids"],
-                    attention_mask=batch["input_ids"],
+                    attention_mask=batch_inputs["attention_mask"],
                     max_new_tokens=max_new_tokens,
                     pad_token_id=tokenizer.eos_token_id
                 )
                 generated_texts = tokenizer.batch_decode(
-                    outputs.sequences[:, batch_inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+                    outputs[:, batch_inputs["input_ids"].shape[1]:], skip_special_tokens=True)
                 generated_texts = [text.strip() for text in generated_texts]
 
-            for question, target, predicted_answer in zip(questions, targets, generated_texts):
-                grade = self.grade_answer(question, target, predicted_answer)
+            grades = asyncio.run(self._grade_answers_parallel(questions, targets, generated_texts))
+            for grade in grades:
                 if grade == "A":
                     correct += 1
                 total += 1

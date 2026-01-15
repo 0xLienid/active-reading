@@ -44,6 +44,7 @@ class TrainingConfig:
     max_steps: int = 10000
     max_seq_length: int = 2048
     warmup_steps: int = 100
+    logging_steps: int = 50
     validation_steps: int = 500
     checkpoint_dir: str = "checkpoints"
     save_total_limit: int = 3
@@ -90,6 +91,7 @@ class MixedDatasetIterator(IterableDataset):
             text,
             truncation=True,
             max_length=self.max_seq_length,
+            # Use fixed-length padding so all processes see identically shaped batches.
             padding="max_length",
             return_tensors="pt",
         )
@@ -125,14 +127,16 @@ class MixedDatasetIterator(IterableDataset):
                     text = self.core_generate_text_function(sample)
 
             tokenized = self._tokenize(text)
+            labels = tokenized["input_ids"].clone()
+            labels[tokenized["attention_mask"] == 0] = -100
             yield {
                 "input_ids": tokenized["input_ids"].squeeze(0),
                 "attention_mask": tokenized["attention_mask"].squeeze(0),
-                "labels": tokenized["input_ids"].squeeze(0),
+                "labels": labels.squeeze(0),
             }
 
 
-def collate_fn(batch: List[dict]) -> dict:
+def collate_fn(batch: List[dict]) -> dict:    
     return {
         "input_ids": torch.stack([x["input_ids"] for x in batch]),
         "attention_mask": torch.stack([x["attention_mask"] for x in batch]),
@@ -360,66 +364,66 @@ def train(
             scheduler.step()
             optimizer.zero_grad()
 
-        global_step += 1
-        progress_bar.update(1)
-        progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
+        if accelerator.sync_gradients:
+            global_step += 1
+            progress_bar.update(1)
+            progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
 
-        if global_step % config.validation_steps == 0:
-            avg_loss = total_loss / config.validation_steps
-
-            if accelerator.is_main_process:
-                logger.info(f"Step {global_step}, Avg Loss: {avg_loss:.4f}")
-                if config.wandb_project:
-                    wandb.log({"train/loss": avg_loss,
-                              "train/step": global_step})
-
-            if validators:
-                unwrapped_model = accelerator.unwrap_model(model)
-                validation_results = run_validation(
-                    unwrapped_model, tokenizer, validators, accelerator.is_main_process
-                )
-
-                avg_score = sum(validation_results.values()) / \
-                    len(validation_results)
-                is_best = avg_score > best_validation_score
-
-                if is_best:
-                    best_validation_score = avg_score
-
+            if global_step % config.logging_steps == 0:
                 if accelerator.is_main_process:
+                    logger.info(f"Step {global_step}, Loss: {loss.item():.4f}")
                     if config.wandb_project:
-                        log_dict = {"val/step": global_step}
-                        for name, score in validation_results.items():
-                            log_dict[f"val/{name}"] = score
-                        log_dict["val/avg_score"] = avg_score
-                        if is_best:
-                            log_dict["val/best_score"] = best_validation_score
-                        wandb.log(log_dict)
+                        wandb.log({"train/loss": loss.item(),
+                                  "train/step": global_step})
 
-                    save_checkpoint(
-                        unwrapped_model,
-                        tokenizer,
-                        config.checkpoint_dir,
-                        global_step,
-                        avg_score,
-                        is_best=is_best,
-                    )
-            else:
-                if accelerator.is_main_process:
+            if global_step % config.validation_steps == 0:
+                if validators:
                     unwrapped_model = accelerator.unwrap_model(model)
-                    save_checkpoint(
-                        unwrapped_model,
-                        tokenizer,
-                        config.checkpoint_dir,
-                        global_step,
-                        0.0,
-                        is_best=False,
+                    validation_results = run_validation(
+                        unwrapped_model, tokenizer, validators, accelerator.is_main_process
                     )
 
-            total_loss = 0.0
+                    avg_score = sum(validation_results.values()) / \
+                        len(validation_results)
+                    is_best = avg_score > best_validation_score
 
-        if global_step >= config.max_steps:
-            break
+                    if is_best:
+                        best_validation_score = avg_score
+
+                    if accelerator.is_main_process:
+                        if config.wandb_project:
+                            log_dict = {"val/step": global_step}
+                            for name, score in validation_results.items():
+                                log_dict[f"val/{name}"] = score
+                            log_dict["val/avg_score"] = avg_score
+                            if is_best:
+                                log_dict["val/best_score"] = best_validation_score
+                            wandb.log(log_dict)
+
+                        save_checkpoint(
+                            unwrapped_model,
+                            tokenizer,
+                            config.checkpoint_dir,
+                            global_step,
+                            avg_score,
+                            is_best=is_best,
+                        )
+                else:
+                    if accelerator.is_main_process:
+                        unwrapped_model = accelerator.unwrap_model(model)
+                        save_checkpoint(
+                            unwrapped_model,
+                            tokenizer,
+                            config.checkpoint_dir,
+                            global_step,
+                            0.0,
+                            is_best=False,
+                        )
+
+                total_loss = 0.0
+
+            if global_step >= config.max_steps:
+                break
 
     progress_bar.close()
 
@@ -497,18 +501,19 @@ if __name__ == "__main__":
         core_dataset_generate_text_function=generate_text_function,
         pretraining_dataset="mlfoundations/dclm-baseline-1.0",
         pretraining_ratio=0.1,
-        batch_size=4,
-        gradient_accumulation_steps=128 // (NUM_GPUS * 4),
+        batch_size=1,
+        gradient_accumulation_steps=128 // (NUM_GPUS * 1),
         learning_rate=1e-5,
         max_seq_length=4096,
         max_steps=20000,
+        logging_steps=50,
         validation_steps=2000,
         wandb_project="active-reading",
         wandb_run_name="llama-3.1-8b-finetune",
     )
 
     validators = [
-        SimpleWikiQAValidator(batch_size=8),
+        SimpleWikiQAValidator(batch_size=64),
     ]
 
     train(config, validators)
